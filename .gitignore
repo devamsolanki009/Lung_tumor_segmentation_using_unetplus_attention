@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# Virtual Environment
+venv/
+env/
+.env
+.venv
+
+# Datasets and Preprocessed Data
+dataset/
+manifest-*/
+preprocessed/
+preprocessed_*/
+verification_images/
+*.dcm
+*.tcia
+
+# Checkpoints and Models
+model_checkpoints/
+*.h5
+*.keras
+*.pth
+*.pt
+*.ckpt
+
+# Logs
+logs/
+*.log
+
+# Other Specific Files/Directories
+Graphviz-*/
+*.csv
