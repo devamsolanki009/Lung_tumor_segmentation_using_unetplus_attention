@@ -1,28 +1,33 @@
-"""DatasetBuilder — loads preprocessed .npy slices, builds train/val/test splits,
-and provides Keras data generators with optional augmentation.
+"""DatasetBuilder — CSV-index-based streaming dataset for Keras training.
+
+Design
+------
+Instead of loading all slices into RAM (which would need ~2 GB for 28K files),
+this class works with **index CSV files** produced by ``build_splits.py``:
+
+    outputs/splits/train_index.csv   (ct_path, mask_path)
+    outputs/splits/val_index.csv
+    outputs/splits/test_index.csv
+
+Training uses ``tf.data.Dataset`` to stream .npy files from disk on-demand,
+one batch at a time.  RAM usage stays constant regardless of dataset size.
 """
 
 from __future__ import annotations
 
+import csv
 import logging
-import os
 from pathlib import Path
-from typing import Generator, List, Optional, Tuple
+from typing import Tuple
 
 import numpy as np
+import tensorflow as tf
 
 logger = logging.getLogger(__name__)
 
-# Type alias
-SplitTuple = Tuple[
-    np.ndarray, np.ndarray,  # X_train, y_train
-    np.ndarray, np.ndarray,  # X_val,   y_val
-    np.ndarray, np.ndarray,  # X_test,  y_test
-]
-
 
 class DatasetBuilder:
-    """Builds train / val / test splits from preprocessed .npy slice files.
+    """Streaming dataset builder backed by CSV index files.
 
     Parameters
     ----------
@@ -32,215 +37,188 @@ class DatasetBuilder:
 
     def __init__(self, config: dict) -> None:
         self.cfg = config
-        prep = config["preprocessing"]
-        self.train_ratio: float = prep["train_ratio"]
-        self.val_ratio: float = prep["val_ratio"]
-        self.test_ratio: float = prep["test_ratio"]
-        self.random_seed: int = prep["random_seed"]
         self.input_shape: Tuple[int, int] = tuple(config["model"]["input_shape"][:2])
+        self.batch_size: int = config["training"]["batch_size"]
+        self.prefetch: int = config.get("gpu", {}).get("prefetch_buffer", 2)
 
     # ------------------------------------------------------------------
-    # Building splits
+    # Index loading helpers
     # ------------------------------------------------------------------
 
-    def build_dataset(
-        self,
-        cts_dir: str | Path,
-        masks_dir: str | Path,
-    ) -> SplitTuple:
-        """Load all .npy files, shuffle, and split into train/val/test.
-
-        The split is done **patient-aware**: slices from the same patient
-        are kept together in a single split to avoid data leakage.
+    def load_index(self, csv_path: str | Path) -> Tuple[list, list]:
+        """Read a split CSV and return (ct_paths, mask_paths) lists.
 
         Parameters
         ----------
-        cts_dir : str or Path
-            Directory containing ``*_ct_slice_*.npy`` files.
-        masks_dir : str or Path
-            Directory containing ``*_mask_slice_*.npy`` files.
+        csv_path : str or Path
+            Path to a CSV with columns ``ct_path, mask_path``.
 
         Returns
         -------
-        SplitTuple
-            ``(X_train, y_train, X_val, y_val, X_test, y_test)``
-            where X arrays are shape ``(N, H, W, 1)`` and y arrays are
-            shape ``(N, H, W, 1)``, all ``float32``.
+        Tuple[list, list]
         """
-        cts_dir = Path(cts_dir)
-        masks_dir = Path(masks_dir)
+        csv_path = Path(csv_path)
+        if not csv_path.exists():
+            raise FileNotFoundError(
+                f"Index CSV not found: {csv_path}\n"
+                "Run  python build_splits.py  first."
+            )
+        ct_paths, mask_paths = [], []
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                ct_paths.append(row["ct_path"])
+                mask_paths.append(row["mask_path"])
+        logger.info("Loaded index: %s  (%d slices)", csv_path.name, len(ct_paths))
+        return ct_paths, mask_paths
 
-        # Collect all patient IDs present in both dirs
-        patient_ids = self._get_patient_ids(cts_dir, masks_dir)
-        logger.info("Found %d unique patients with preprocessed data.", len(patient_ids))
-
-        # Shuffle patients
-        rng = np.random.default_rng(self.random_seed)
-        patient_ids = list(patient_ids)
-        rng.shuffle(patient_ids)
-
-        # Split patient list
-        n = len(patient_ids)
-        n_train = int(n * self.train_ratio)
-        n_val = int(n * self.val_ratio)
-        train_pids = patient_ids[:n_train]
-        val_pids = patient_ids[n_train: n_train + n_val]
-        test_pids = patient_ids[n_train + n_val:]
-
-        logger.info(
-            "Split: %d train / %d val / %d test patients.",
-            len(train_pids), len(val_pids), len(test_pids),
-        )
-
-        X_train, y_train = self._load_patient_slices(train_pids, cts_dir, masks_dir)
-        X_val, y_val = self._load_patient_slices(val_pids, cts_dir, masks_dir)
-        X_test, y_test = self._load_patient_slices(test_pids, cts_dir, masks_dir)
-
-        logger.info(
-            "Slice counts — train: %d, val: %d, test: %d",
-            len(X_train), len(X_val), len(X_test),
-        )
-        return X_train, y_train, X_val, y_val, X_test, y_test
-
-    # ------------------------------------------------------------------
-    # Persistence helpers
-    # ------------------------------------------------------------------
-
-    def save_splits(self, splits: SplitTuple, output_dir: str | Path) -> None:
-        """Save all six split arrays as .npy files.
-
-        Parameters
-        ----------
-        splits : SplitTuple
-            Result of build_dataset().
-        output_dir : str or Path
-            Directory to save into (will be created if missing).
-        """
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        names = ["X_train", "y_train", "X_val", "y_val", "X_test", "y_test"]
-        for name, arr in zip(names, splits):
-            path = output_dir / f"{name}.npy"
-            np.save(path, arr)
-            logger.info("Saved %s → %s  (shape %s)", name, path, arr.shape)
-
-    def load_splits(self, splits_dir: str | Path) -> SplitTuple:
-        """Load pre-saved split .npy files.
+    def load_splits(self, splits_dir: str | Path) -> Tuple[list, list, list, list, list, list]:
+        """Load all three index CSVs.
 
         Parameters
         ----------
         splits_dir : str or Path
-            Directory previously written by save_splits().
+            Directory containing train_index.csv, val_index.csv, test_index.csv.
 
         Returns
         -------
-        SplitTuple
+        Tuple
+            ``(train_ct, train_mask, val_ct, val_mask, test_ct, test_mask)``
+            where each element is a list of file path strings.
         """
         splits_dir = Path(splits_dir)
-        names = ["X_train", "y_train", "X_val", "y_val", "X_test", "y_test"]
-        arrays = []
-        for name in names:
-            path = splits_dir / f"{name}.npy"
-            if not path.exists():
-                raise FileNotFoundError(f"Split file not found: {path}")
-            arrays.append(np.load(path))
-            logger.info("Loaded %s from %s (shape %s)", name, path, arrays[-1].shape)
-        return tuple(arrays)  # type: ignore[return-value]
+        train_ct, train_mask = self.load_index(splits_dir / "train_index.csv")
+        val_ct,   val_mask   = self.load_index(splits_dir / "val_index.csv")
+        test_ct,  test_mask  = self.load_index(splits_dir / "test_index.csv")
+        logger.info(
+            "Splits loaded — train: %d, val: %d, test: %d slices",
+            len(train_ct), len(val_ct), len(test_ct),
+        )
+        return train_ct, train_mask, val_ct, val_mask, test_ct, test_mask
 
     # ------------------------------------------------------------------
-    # Keras data generator
+    # tf.data pipeline
     # ------------------------------------------------------------------
 
-    def get_data_generator(
+    def get_tf_dataset(
         self,
-        X: np.ndarray,
-        y: np.ndarray,
-        batch_size: int,
+        ct_paths: list,
+        mask_paths: list,
+        batch_size: int | None = None,
         augment: bool = False,
-    ) -> Generator:
-        """Yield (batch_X, batch_y) pairs indefinitely.
+        shuffle: bool = True,
+    ) -> tf.data.Dataset:
+        """Build a streaming tf.data.Dataset from file path lists.
+
+        Files are loaded on-the-fly by a tf.numpy_function wrapper.
+        Memory usage is constant (one batch in RAM at a time).
 
         Parameters
         ----------
-        X : np.ndarray
-            Input CT slices, shape ``(N, H, W, 1)``.
-        y : np.ndarray
-            Mask slices, shape ``(N, H, W, 1)``.
-        batch_size : int
-        augment : bool
-            If True, applies random horizontal flip to each batch.
+        ct_paths : list[str]   List of absolute paths to CT .npy files.
+        mask_paths : list[str] List of absolute paths to mask .npy files.
+        batch_size : int, optional   Defaults to config value.
+        augment : bool   Apply random horizontal flip augmentation.
+        shuffle : bool   Shuffle file order each epoch.
 
-        Yields
-        ------
-        Tuple[np.ndarray, np.ndarray]
+        Returns
+        -------
+        tf.data.Dataset
+            Yields ``(ct_batch, mask_batch)`` tensors of shape
+            ``(B, H, W, 1)`` dtype ``float32``.
         """
-        n = len(X)
-        indices = np.arange(n)
-        rng = np.random.default_rng(self.random_seed)
+        batch_size = batch_size or self.batch_size
+        h, w = self.input_shape
 
-        while True:
-            rng.shuffle(indices)
-            for start in range(0, n, batch_size):
-                batch_idx = indices[start: start + batch_size]
-                bx = X[batch_idx].copy()
-                by = y[batch_idx].copy()
+        # Convert to tensors so tf.data can handle them
+        ct_tensor   = tf.constant(ct_paths,   dtype=tf.string)
+        mask_tensor = tf.constant(mask_paths, dtype=tf.string)
 
-                if augment:
-                    bx, by = self._augment_batch(bx, by, rng)
+        ds = tf.data.Dataset.from_tensor_slices((ct_tensor, mask_tensor))
 
-                yield bx, by
+        if shuffle:
+            ds = ds.shuffle(buffer_size=min(len(ct_paths), 2000), reshuffle_each_iteration=True)
+
+        # Load .npy files via numpy function
+        def _load_pair(ct_path: tf.Tensor, mask_path: tf.Tensor):
+            ct, mask = tf.numpy_function(
+                func=self._load_npy_pair,
+                inp=[ct_path, mask_path],
+                Tout=[tf.float32, tf.float32],
+            )
+            ct.set_shape([h, w, 1])
+            mask.set_shape([h, w, 1])
+            return ct, mask
+
+        ds = ds.map(_load_pair, num_parallel_calls=tf.data.AUTOTUNE)
+
+        if augment:
+            ds = ds.map(self._augment_tf, num_parallel_calls=tf.data.AUTOTUNE)
+
+        ds = ds.batch(batch_size, drop_remainder=False)
+        ds = ds.prefetch(self.prefetch)
+        return ds
+
+    # ------------------------------------------------------------------
+    # In-memory helpers kept for small datasets / evaluation
+    # ------------------------------------------------------------------
+
+    def load_test_arrays(
+        self,
+        test_ct: list,
+        test_mask: list,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Load the test split fully into RAM (only the test set is small enough).
+
+        Parameters
+        ----------
+        test_ct : list   CT file paths.
+        test_mask : list Mask file paths.
+
+        Returns
+        -------
+        Tuple[np.ndarray, np.ndarray]
+            ``X_test`` shape ``(N, H, W, 1)``, ``y_test`` shape ``(N, H, W, 1)``.
+        """
+        h, w = self.input_shape
+        logger.info("Loading %d test slices into RAM …", len(test_ct))
+        cts, masks = [], []
+        for cp, mp in zip(test_ct, test_mask):
+            ct, mask = self._load_npy_pair(cp, mp)
+            cts.append(ct)
+            masks.append(mask)
+        X = np.stack(cts)   # (N, H, W, 1)
+        y = np.stack(masks) # (N, H, W, 1)
+        logger.info("Test arrays loaded: X=%s  y=%s", X.shape, y.shape)
+        return X, y
 
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _get_patient_ids(cts_dir: Path, masks_dir: Path) -> List[str]:
-        """Return patient IDs present in both CT and mask directories."""
-        ct_files = {f.stem for f in cts_dir.glob("*_ct_slice_*.npy")}
-        mask_files = {f.stem for f in masks_dir.glob("*_mask_slice_*.npy")}
-
-        # Extract patient IDs: e.g. "LUNG1-001_ct_slice_000" → "LUNG1-001"
-        def _pid(stem: str, tag: str) -> str:
-            return stem.split(tag)[0].rstrip("_")
-
-        ct_pids = {_pid(s, "_ct_slice_") for s in ct_files}
-        mask_pids = {_pid(s, "_mask_slice_") for s in mask_files}
-        return sorted(ct_pids & mask_pids)
-
-    def _load_patient_slices(
-        self,
-        patient_ids: List[str],
-        cts_dir: Path,
-        masks_dir: Path,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """Load and concatenate slices for a list of patient IDs."""
-        all_cts, all_masks = [], []
-        for pid in patient_ids:
-            ct_files = sorted(cts_dir.glob(f"{pid}_ct_slice_*.npy"))
-            mask_files = sorted(masks_dir.glob(f"{pid}_mask_slice_*.npy"))
-            for cf, mf in zip(ct_files, mask_files):
-                ct = np.load(cf).astype(np.float32)
-                mask = np.load(mf).astype(np.float32)
-                # Add channel dimension: (H, W) → (H, W, 1)
-                all_cts.append(ct[..., np.newaxis])
-                all_masks.append(mask[..., np.newaxis])
-
-        if not all_cts:
-            h, w = self.input_shape
-            return np.empty((0, h, w, 1), np.float32), np.empty((0, h, w, 1), np.float32)
-
-        return np.stack(all_cts), np.stack(all_masks)
+    def _load_npy_pair(ct_path, mask_path) -> Tuple[np.ndarray, np.ndarray]:
+        """Load one CT + mask .npy pair and add channel dim."""
+        # Accept both bytes (from tf) and str
+        if isinstance(ct_path, bytes):
+            ct_path   = ct_path.decode("utf-8")
+            mask_path = mask_path.decode("utf-8")
+        ct   = np.load(ct_path).astype(np.float32)
+        mask = np.load(mask_path).astype(np.float32)
+        # Ensure (H, W) → (H, W, 1)
+        if ct.ndim == 2:
+            ct   = ct[..., np.newaxis]
+        if mask.ndim == 2:
+            mask = mask[..., np.newaxis]
+        return ct, mask
 
     @staticmethod
-    def _augment_batch(
-        bx: np.ndarray,
-        by: np.ndarray,
-        rng: np.random.Generator,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """Apply random horizontal flip augmentation in-place."""
-        for i in range(len(bx)):
-            if rng.random() > 0.5:
-                bx[i] = np.fliplr(bx[i])
-                by[i] = np.fliplr(by[i])
-        return bx, by
+    def _augment_tf(
+        ct: tf.Tensor,
+        mask: tf.Tensor,
+    ) -> Tuple[tf.Tensor, tf.Tensor]:
+        """Random horizontal flip augmentation (applied per-sample)."""
+        if tf.random.uniform(()) > 0.5:
+            ct   = tf.image.flip_left_right(ct)
+            mask = tf.image.flip_left_right(mask)
+        return ct, mask

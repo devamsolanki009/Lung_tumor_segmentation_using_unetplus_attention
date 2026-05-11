@@ -1,20 +1,4 @@
-"""run_training.py — CLI entry point for model training.
-
-Usage
------
-    python scripts/run_training.py
-    python scripts/run_training.py --config path/to/config.yaml
-    python scripts/run_training.py --splits-dir path/to/splits/
-
-What it does
-------------
-1. Loads config.
-2. Loads pre-saved train / val / test splits from outputs/splits/.
-3. Builds and compiles the Attention U-Net via get_model(config).
-4. Instantiates Trainer and runs train().
-5. Saves best model to outputs/models/best_model.keras.
-6. Saves training history plot to outputs/figures/training_curves.png.
-"""
+"""run_training.py — CLI entry point for model training."""
 
 from __future__ import annotations
 
@@ -44,7 +28,7 @@ logger = logging.getLogger("run_training")
 def main(config_path: str | None = None, splits_dir: str | None = None) -> None:
     cfg = load_config(config_path)
 
-    # ------------------------------------------------------------------ 
+    # ------------------------------------------------------------------
     # GPU setup — MUST be first, before any TF graph is built
     # ------------------------------------------------------------------
     gpu_info = setup_gpu(cfg)
@@ -57,23 +41,36 @@ def main(config_path: str | None = None, splits_dir: str | None = None) -> None:
 
     logger.info("=== Lung Tumor Segmentation — Training Pipeline ===")
     logger.info("Splits directory: %s", splits_dir)
-    logger.info("GPU: %s | Mixed precision: %s", gpu_info['gpu_name'], gpu_info['mixed_precision'])
+    logger.info("GPU: %s | Mixed precision: %s", gpu_info["gpu_name"], gpu_info["mixed_precision"])
 
     # ------------------------------------------------------------------
-    # Load data splits
+    # Load CSV index files (fast — just file paths, no RAM loading)
     # ------------------------------------------------------------------
     builder = DatasetBuilder(cfg)
     try:
-        X_train, y_train, X_val, y_val, X_test, y_test = builder.load_splits(splits_dir)
+        train_ct, train_mask, val_ct, val_mask, test_ct, test_mask = builder.load_splits(splits_dir)
     except FileNotFoundError as exc:
-        logger.error(
-            "Splits not found. Run run_preprocessing.py first.\n  %s", exc
-        )
+        logger.error("Splits not found. Run  python build_splits.py  first.\n  %s", exc)
         sys.exit(1)
 
     logger.info(
-        "Data loaded — train: %d, val: %d, test: %d slices",
-        len(X_train), len(X_val), len(X_test),
+        "Index loaded — train: %d, val: %d, test: %d slices",
+        len(train_ct), len(val_ct), len(test_ct),
+    )
+
+    # ------------------------------------------------------------------
+    # Build streaming tf.data datasets (no RAM allocation)
+    # ------------------------------------------------------------------
+    batch_size = cfg["training"]["batch_size"]
+    train_ds = builder.get_tf_dataset(train_ct, train_mask, batch_size=batch_size, augment=True,  shuffle=True)
+    val_ds   = builder.get_tf_dataset(val_ct,   val_mask,   batch_size=batch_size, augment=False, shuffle=False)
+
+    steps_per_epoch = len(train_ct) // batch_size
+    val_steps       = len(val_ct)   // batch_size
+
+    logger.info(
+        "Batch size: %d | Steps/epoch: %d | Val steps: %d",
+        batch_size, steps_per_epoch, val_steps,
     )
 
     # ------------------------------------------------------------------
@@ -85,20 +82,20 @@ def main(config_path: str | None = None, splits_dir: str | None = None) -> None:
     # ------------------------------------------------------------------
     # Train
     # ------------------------------------------------------------------
-    trainer = Trainer(model, cfg, (X_train, y_train, X_val, y_val))
-    history = trainer.train()
+    trainer = Trainer(model, cfg)
+    history = trainer.train(train_ds, val_ds, steps_per_epoch, val_steps)
     trainer.save_training_curve(history)
-    log_gpu_memory()  # Report peak VRAM used
+    log_gpu_memory()
 
     # ------------------------------------------------------------------
     # Summary
     # ------------------------------------------------------------------
-    best_epoch = int(history.history["val_dice_coefficient"].index(
-        max(history.history["val_dice_coefficient"])
-    )) + 1
-    best_dice = max(history.history["val_dice_coefficient"])
-    logger.info("=== Training Summary ===")
-    logger.info("Best val Dice : %.4f  (epoch %d)", best_dice, best_epoch)
+    dice_hist = history.history.get("val_dice_coefficient", [])
+    if dice_hist:
+        best_epoch = int(dice_hist.index(max(dice_hist))) + 1
+        best_dice  = max(dice_hist)
+        logger.info("=== Training Summary ===")
+        logger.info("Best val Dice : %.4f  (epoch %d)", best_dice, best_epoch)
     logger.info(
         "Best model saved → %s",
         Path(cfg["paths"]["output_models"]) / "best_model.keras",

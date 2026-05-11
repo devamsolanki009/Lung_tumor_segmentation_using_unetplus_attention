@@ -12,10 +12,8 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Tuple
 
 import matplotlib.pyplot as plt
-import numpy as np
 import tensorflow as tf
 from tensorflow.keras import callbacks as cb
 
@@ -31,20 +29,15 @@ class Trainer:
         Compiled model returned by ``get_model(config)``.
     config : dict
         Full project config dict.
-    data : tuple
-        ``(X_train, y_train, X_val, y_val)`` — NumPy arrays, each of shape
-        ``(N, H, W, 1)``.
     """
 
     def __init__(
         self,
         model: tf.keras.Model,
         config: dict,
-        data: Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
     ) -> None:
         self.model = model
         self.cfg = config
-        self.X_train, self.y_train, self.X_val, self.y_val = data
 
         paths = config["paths"]
         self.model_dir = Path(paths["output_models"])
@@ -119,28 +112,37 @@ class Trainer:
     # Training
     # ------------------------------------------------------------------
 
-    def train(self) -> tf.keras.callbacks.History:
-        """Run model.fit() and return the History object.
+    def train(
+        self,
+        train_ds: tf.data.Dataset,
+        val_ds: tf.data.Dataset,
+        steps_per_epoch: int | None = None,
+        validation_steps: int | None = None,
+    ) -> tf.keras.callbacks.History:
+        """Run model.fit() against tf.data streaming datasets.
+
+        Parameters
+        ----------
+        train_ds : tf.data.Dataset
+        val_ds   : tf.data.Dataset
+        steps_per_epoch : int, optional
+        validation_steps : int, optional
 
         Returns
         -------
         tf.keras.callbacks.History
         """
         logger.info(
-            "Starting training — epochs=%d, batch_size=%d, "
-            "train_samples=%d, val_samples=%d",
-            self.epochs,
-            self.batch_size,
-            len(self.X_train),
-            len(self.X_val),
+            "Starting training — epochs=%d, batch_size=%d",
+            self.epochs, self.batch_size,
         )
 
         history = self.model.fit(
-            self.X_train,
-            self.y_train,
-            batch_size=self.batch_size,
+            train_ds,
             epochs=self.epochs,
-            validation_data=(self.X_val, self.y_val),
+            steps_per_epoch=steps_per_epoch,
+            validation_data=val_ds,
+            validation_steps=validation_steps,
             callbacks=self.get_callbacks(),
             verbose=1,
         )
