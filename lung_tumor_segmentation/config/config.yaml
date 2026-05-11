@@ -1,0 +1,44 @@
+paths:
+  raw_dataset: "dataset/"
+  preprocessed_cts: "preprocessed_cts_128x128/"
+  preprocessed_masks: "preprocessed_masks_128x128/"
+  output_models: "lung_tumor_segmentation/outputs/models/"
+  output_logs: "lung_tumor_segmentation/outputs/logs/"
+  output_metrics: "lung_tumor_segmentation/outputs/metrics/"
+  output_figures: "lung_tumor_segmentation/outputs/figures/"
+
+preprocessing:
+  target_size: [128, 128]
+  min_max_normalize: true
+  skip_empty_masks: true
+  train_ratio: 0.70
+  val_ratio: 0.15
+  test_ratio: 0.15
+  random_seed: 42
+
+model:
+  input_shape: [128, 128, 1]
+  filters: [64, 128, 256, 512]
+  dropout_rate: 0.3
+  use_attention: true
+
+training:
+  epochs: 100
+  batch_size: 16
+  learning_rate: 0.0001
+  patience: 15
+  reduce_lr_factor: 0.5
+  reduce_lr_patience: 7
+
+augmentation:
+  enabled: true
+  horizontal_flip: true
+  vertical_flip: false
+  rotation_range: 15
+  zoom_range: 0.1
+  elastic_deformation: false
+
+evaluation:
+  threshold: 0.5
+  save_worst_n: 5
+  save_best_n: 5
