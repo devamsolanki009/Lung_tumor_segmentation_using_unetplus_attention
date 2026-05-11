@@ -104,7 +104,7 @@ def write_csv(pids, filename):
         writer = csv.writer(f)
         writer.writerow(["ct_path", "mask_path"])
         writer.writerows(rows)
-    print(f"  Saved {len(rows):>6} rows → {out_path.name}")
+    print(f"  Saved {len(rows):>6} rows -> {out_path.name}")
     return len(rows)
 
 print(f"\n=== Saving index CSVs to {OUT_DIR} ===")
@@ -112,5 +112,5 @@ write_csv(train_pids, "train_index.csv")
 write_csv(val_pids,   "val_index.csv")
 write_csv(test_pids,  "test_index.csv")
 
-print("\n✔  Done. No large .npy files were created — training streams files on-demand.")
+print("\nDone. No large .npy files were created - training streams files on-demand.")
 print("   Next step: python main.py --train")
