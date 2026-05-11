@@ -158,7 +158,11 @@ def build_model(
         x = _decoder_block(x, skip, f, use_attention=use_attention, name=f"dec{i+1}")
 
     # ---- Output --------------------------------------------------------
-    outputs = layers.Conv2D(1, kernel_size=1, activation="sigmoid", name="output")(x)
+    # Cast to float32 explicitly: required for mixed_float16 policy.
+    # The sigmoid activation runs in float16 for speed; the cast ensures
+    # the loss function always receives float32, preventing NaN gradients.
+    x_out = layers.Conv2D(1, kernel_size=1, name="output_logits")(x)
+    outputs = layers.Activation("sigmoid", dtype="float32", name="output")(x_out)
 
     model = Model(inputs=inputs, outputs=outputs, name="AttentionUNet")
     return model
@@ -188,6 +192,13 @@ def get_model(config: dict) -> Model:
     )
 
     optimizer = tf.keras.optimizers.Adam(learning_rate=tcfg["learning_rate"])
+
+    # Wrap with LossScaleOptimizer when mixed precision is active.
+    # This scales the loss up to avoid underflow in float16 gradients,
+    # then scales gradients back down before the weight update.
+    policy = tf.keras.mixed_precision.global_policy()
+    if policy.name == "mixed_float16":
+        optimizer = tf.keras.mixed_precision.LossScaleOptimizer(optimizer)
 
     model.compile(
         optimizer=optimizer,

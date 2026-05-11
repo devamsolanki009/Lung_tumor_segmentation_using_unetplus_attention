@@ -24,11 +24,16 @@ model:
 
 training:
   epochs: 100
-  batch_size: 16
+  batch_size: 32          # RTX 4060 8GB: safe at 128x128; drop to 16 if OOM
   learning_rate: 0.0001
   patience: 15
   reduce_lr_factor: 0.5
   reduce_lr_patience: 7
+
+gpu:
+  mixed_precision: true   # float16 compute — ~2x throughput on RTX 4060
+  memory_growth: true     # prevent TF from allocating all 8GB upfront
+  prefetch_buffer: 2      # AUTOTUNE-style buffer for the data pipeline
 
 augmentation:
   enabled: true

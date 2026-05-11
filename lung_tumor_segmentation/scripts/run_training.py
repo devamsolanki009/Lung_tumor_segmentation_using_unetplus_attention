@@ -31,6 +31,7 @@ from lung_tumor_segmentation.config.loader import load_config
 from lung_tumor_segmentation.models.attention_unet import get_model
 from lung_tumor_segmentation.preprocessing.dataset_builder import DatasetBuilder
 from lung_tumor_segmentation.training.trainer import Trainer
+from lung_tumor_segmentation.training.gpu_utils import setup_gpu, log_gpu_memory
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,6 +44,11 @@ logger = logging.getLogger("run_training")
 def main(config_path: str | None = None, splits_dir: str | None = None) -> None:
     cfg = load_config(config_path)
 
+    # ------------------------------------------------------------------ 
+    # GPU setup — MUST be first, before any TF graph is built
+    # ------------------------------------------------------------------
+    gpu_info = setup_gpu(cfg)
+
     # Resolve splits directory
     if splits_dir is None:
         splits_dir = _REPO_ROOT / "lung_tumor_segmentation" / "outputs" / "splits"
@@ -51,6 +57,7 @@ def main(config_path: str | None = None, splits_dir: str | None = None) -> None:
 
     logger.info("=== Lung Tumor Segmentation — Training Pipeline ===")
     logger.info("Splits directory: %s", splits_dir)
+    logger.info("GPU: %s | Mixed precision: %s", gpu_info['gpu_name'], gpu_info['mixed_precision'])
 
     # ------------------------------------------------------------------
     # Load data splits
@@ -81,6 +88,7 @@ def main(config_path: str | None = None, splits_dir: str | None = None) -> None:
     trainer = Trainer(model, cfg, (X_train, y_train, X_val, y_val))
     history = trainer.train()
     trainer.save_training_curve(history)
+    log_gpu_memory()  # Report peak VRAM used
 
     # ------------------------------------------------------------------
     # Summary
